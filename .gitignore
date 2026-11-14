@@ -1,0 +1,7 @@
+*.key
+*.pem
+*.crt
+*.env
+id_ed25519*
+*.log
+__pycache__/
