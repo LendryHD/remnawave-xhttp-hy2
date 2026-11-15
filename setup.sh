@@ -1,32 +1,51 @@
 #!/usr/bin/env bash
 # Дополнение к eGames: XHTTP + Hysteria2, не устанавливает Remnawave/NetBird.
 set -Eeuo pipefail
+set +x  # Никогда не печатать API-токен в трассировке shell
 umask 077
 APP=/opt/remnawave-hy2
 PANEL_CERT=/opt/remnawave/xray-ssl
 PANEL_SSL_CONTAINER=/var/lib/remnawave/configs/xray/ssl
-STAGING=/home/lendry/.hy2-transfer
-SELF=$(readlink -f "$0")
+# Выделенный непривилегированный пользователь SFTP. Не используем sudo-пользователя панели.
+UPLOAD_USER=rw-hy2-upload
+UPLOAD_HOME=/var/lib/remnawave-hy2-upload
+STAGING="$UPLOAD_HOME/incoming"
+CRED_DIR=/etc/remnawave-hy2
+PANEL_API_URL=http://127.0.0.1:3000
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 log(){ printf '[hy2] %s\n' "$*"; }
 die(){ printf '[ОШИБКА] %s\n' "$*" >&2; exit 1; }
 require_root(){ [[ $EUID -eq 0 ]] || die 'Запустите от root'; }
 valid_domain(){ [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$1" == *.* ]] && [[ ! "$1" =~ [.]\.|^[-]|[-]$ ]]; }
 need_domain(){ valid_domain "$DOMAIN" || die 'Неверное имя домена'; }
 usage(){ cat <<'HELP'
-Remnawave XHTTP + Hysteria2 companion
-  setup.sh node DOMAIN PANEL_IP [SSH_USER=lendry]
-    Подготовить Caddy ноды, UDP/443, создать ключ и таймер доставки сертификата.
-  setup.sh panel DOMAIN NODE_PUBLIC_IP NODE_PUBLIC_KEY [SSH_USER=lendry]
-    Разрешить ключ только для SFTP, создать staging и таймер импорта сертификата.
-  setup.sh node-sync DOMAIN PANEL_IP [SSH_USER=lendry]
+Remnawave XHTTP + Hysteria2 companion v0.2
+  setup.sh node DOMAIN PANEL_IP
+    Подготовить XHTTP, UDP/443, сертификаты и таймер (новая нода после eGames).
+  setup.sh migrate DOMAIN PANEL_IP
+    Подключить автообновление сертификата на УЖЕ РАБОТАЮЩЕЙ ноде; Caddy/Xray не изменяются.
+  setup.sh panel DOMAIN NODE_PUBLIC_IP 'ssh-ed25519 AAAA...'
+    Настроить отдельного SFTP-пользователя и таймер импорта сертификатов на панели.
+  setup.sh api-setup DOMAIN NODE_UUID
+    Скрыто запросить API-токен Remnawave, проверить его через GET ноды и сохранить только на панели (0600).
+  setup.sh api-test DOMAIN | api-delete DOMAIN
+  setup.sh node-sync DOMAIN PANEL_IP
   setup.sh panel-sync
-  setup.sh status DOMAIN
   setup.sh panel-apply DOMAIN
-    Если настроен локальный API-токен, отправить Force Restart только целевой ноды.
-Скрипт НЕ устанавливает Remnawave, НЕ изменяет REALITY/NetBird/панельный Caddy,
-НЕ добавляет inbounds/hosts в панель автоматически.
+  setup.sh status DOMAIN
+  setup.sh cleanup-legacy-panel DOMAIN
+    После успешной миграции отозвать ровно старый ключ hy2-transfer-temp (интерактивно).
+  setup.sh cleanup-legacy-node DOMAIN
+    Удалить старый /root/.ssh/hy2-transfer-key* после успешной передачи (интерактивно).
+
+Важно: Скрипт не устанавливает Remnawave/NetBird, не создаёт hosts/inbounds в панели,
+не меняет Caddy панели, MFA, REALITY и не настраивает каскады.
 HELP
 }
+valid_uuid(){ [[ "$1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; }
+valid_endpoint(){ [[ "$1" =~ ^[a-zA-Z0-9.:_-]+$ ]]; }
+validate_panel_host(){ valid_endpoint "$PANEL_HOST" || die 'Неверный адрес панели'; }
+
 check_pair(){
   local cert="$1" key="$2" domain="$3" a b
   [[ -s "$cert" && -s "$key" ]] || return 1
@@ -38,7 +57,7 @@ check_pair(){
 }
 install_self(){
   install -d -m 700 "$APP"
-  install -m 700 "$SELF" "$APP/setup.sh"
+  [[ "$SELF" == "$APP/setup.sh" ]] || install -m 700 "$SELF" "$APP/setup.sh"
 }
 write_node_templates(){
   local out="$APP/examples/$DOMAIN"
@@ -140,30 +159,48 @@ EOF
   systemctl daemon-reload
   systemctl enable --now "${name}.timer" >/dev/null
 }
+install_node_sync(){
+  install_self
+  install -d -m 700 "$APP/keys"
+  local key="$APP/keys/${DOMAIN}.ed25519"
+  if [[ ! -e "$key" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$key" -C "hy2-sync-${DOMAIN}" </dev/null
+    chmod 600 "$key"
+  fi
+  [[ -r "$key.pub" ]] || die 'Не найден публичный ключ синхронизации'
+  printf 'PANEL_HOST=%s\nUPLOAD_USER=%s\n' "$PANEL_HOST" "$UPLOAD_USER" > "$APP/node-${DOMAIN}.conf"
+  chmod 600 "$APP/node-${DOMAIN}.conf"
+  service_timer "rw-hy2-push-${DOMAIN}" "$APP/setup.sh node-sync $DOMAIN $PANEL_HOST" 12h
+  log 'Публичный ключ для регистрации на панели:'
+  cat "$key.pub"
+  log "На ПАНЕЛИ: sudo bash setup.sh panel $DOMAIN NODE_PUBLIC_IP 'ПУБЛИЧНЫЙ_КЛЮЧ_ИЗ_ВЫВОДА'"
+  log 'До регистрации ключа, проверки SSH fingerprint и первого успешного node-sync таймер не сможет доставлять сертификат.'
+}
 node_setup(){
-  require_root; need_domain
+  require_root; need_domain; validate_panel_host
   command -v docker >/dev/null || die 'Нужен Docker'
   command -v openssl >/dev/null || die 'Нужен openssl'
   command -v python3 >/dev/null || die 'Нужен python3'
-  install_self; configure_caddy; write_node_templates
+  configure_caddy
+  write_node_templates
   if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     ufw allow 443/udp comment 'Remnawave Hysteria2' >/dev/null
     log 'UFW: разрешён 443/udp'
   fi
-  install -d -m 700 "$APP/keys"
-  local key="$APP/keys/${DOMAIN}.ed25519"
-  if [[ ! -f "$key" ]]; then
-    ssh-keygen -q -t ed25519 -N '' -f "$key" -C "hy2-sync-${DOMAIN}" </dev/null
-    chmod 600 "$key"
-  fi
-  printf '%s %s\n' "$PANEL_HOST" "$SSH_USER" > "$APP/node-${DOMAIN}.conf"
-  chmod 600 "$APP/node-${DOMAIN}.conf"
-  service_timer "rw-hy2-push-${DOMAIN}" "$APP/setup.sh node-sync $DOMAIN $PANEL_HOST $SSH_USER" 12h
-  log 'Публичный ключ для регистрации на панели:'
-  cat "$key.pub"
-  log "На ПАНЕЛИ: bash setup.sh panel $DOMAIN NODE_PUBLIC_IP 'ПУБЛИЧНЫЙ_КЛЮЧ_ОДНОЙ_СТРОКОЙ' $SSH_USER"
-  log 'Таймер создан. До регистрации ключа на панели передача сертификата не заработает.'
+  install_node_sync
 }
+migrate(){
+  require_root; need_domain; validate_panel_host
+  command -v docker >/dev/null || die 'Нужен Docker'
+  docker inspect remnanode >/dev/null 2>&1 || die 'Не найдена существующая Remnawave Node'
+  docker inspect caddy-remnawave >/dev/null 2>&1 || die 'Не найден существующий Caddy ноды'
+  grep -Fq 'reverse_proxy unix+h2c//dev/shm/xrxh.socket' /opt/remnanode/Caddyfile || die 'XHTTP в Caddy отсутствует. Используйте режим node после проверки.'
+  [[ -S /dev/shm/xrxh.socket ]] || die 'XHTTP не запущен: нет xrxh.socket'
+  ss -lunp | grep -Eq ':[4]43[[:space:]]' || die 'Нет UDP/443 для Hysteria2'
+  log 'REALITY, Caddyfile и конфигурация Xray не будут изменены.'
+  install_node_sync
+}
+
 find_caddy_cert_dir(){
   local d
   d=$(docker exec caddy-remnawave sh -c "find /data/caddy/certificates -type f -name '${DOMAIN}.crt' 2>/dev/null | head -n 1" | tr -d '\r')
@@ -172,8 +209,9 @@ find_caddy_cert_dir(){
 }
 node_sync(){
   require_root; need_domain
+  validate_panel_host
   local lock="$APP/push-${DOMAIN}.lock" key="$APP/keys/${DOMAIN}.ed25519" tmp cert_dir
-  [[ -r "$key" ]] || die 'Нет ключа отправки: установите режим node'
+  [[ -r "$key" ]] || die 'Нет ключа отправки: установите режим node/migrate'
   exec 9>"$lock"; flock -n 9 || exit 0
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   cert_dir=$(find_caddy_cert_dir)
@@ -183,43 +221,49 @@ node_sync(){
   # OpenSSH scp по умолчанию использует SFTP; на панели ключ ограничен sftp-server.
   scp -B -q -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
     "$tmp/fullchain.pem" "$tmp/privkey.key" \
-    "${SSH_USER}@${PANEL_HOST}:${STAGING}/${DOMAIN}/" || die 'SFTP недоступен. Проверьте регистрацию ключа и known_hosts.'
+    "${UPLOAD_USER}@${PANEL_HOST}:${STAGING}/${DOMAIN}/" || die 'SFTP недоступен. Проверьте регистрацию ключа и known_hosts.'
+  install -d -m 700 "$APP/state"
+  date -Is > "$APP/state/$DOMAIN.sent-ok"
+  chmod 600 "$APP/state/$DOMAIN.sent-ok"
   log "Сертификат $DOMAIN отправлен на панель"
 }
 panel_setup(){
   require_root; need_domain
-  [[ "$NODE_IP" =~ ^[0-9a-fA-F:.]+$ ]] || die 'Неверный IP ноды'
+  [[ "$NODE_IP" =~ ^[0-9a-fA-F:.]+$ ]] || die 'Неверный IP-адрес ноды'
   [[ "$PUBLIC_KEY" =~ ^ssh-ed25519[[:space:]]+[a-zA-Z0-9+/=]+([[:space:]]+[a-zA-Z0-9_.@-]+)?$ ]] || die 'Неверный формат публичного ключа Ed25519'
-  id "$SSH_USER" >/dev/null || die 'SSH-пользователь отсутствует'
+  command -v useradd >/dev/null || die 'Нужен useradd'
+  local sftp=/usr/lib/openssh/sftp-server
+  [[ -x "$sftp" ]] || die "Нет $sftp; проверьте пакет openssh-sftp-server"
   install_self
-  install -d -m 700 -o "$SSH_USER" -g "$(id -gn "$SSH_USER")" "$STAGING"
-  install -d -m 700 -o "$SSH_USER" -g "$(id -gn "$SSH_USER")" "$STAGING/$DOMAIN"
+  if ! id "$UPLOAD_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir "$UPLOAD_HOME" --shell /bin/sh "$UPLOAD_USER"
+    passwd -l "$UPLOAD_USER" >/dev/null 2>&1 || true
+  fi
+  [[ "$(getent passwd "$UPLOAD_USER" | cut -d: -f6)" == "$UPLOAD_HOME" ]] || die 'Уже существующий SFTP-пользователь имеет другой HOME'
+  [[ "$(id -Gn "$UPLOAD_USER")" != *sudo* ]] || die 'SFTP-пользователь состоит в группе sudo'
+  # HOME и .ssh защищены от изменения самим пользователем SFTP.
+  chown root:root "$UPLOAD_HOME"; chmod 755 "$UPLOAD_HOME"
+  install -d -m 755 -o root -g root "$UPLOAD_HOME/.ssh"
+  local auth="$UPLOAD_HOME/.ssh/authorized_keys"
+  touch "$auth"; chown root:root "$auth"; chmod 644 "$auth"
+  install -d -m 700 -o "$UPLOAD_USER" -g "$(id -gn "$UPLOAD_USER")" "$STAGING"
+  install -d -m 700 -o "$UPLOAD_USER" -g "$(id -gn "$UPLOAD_USER")" "$STAGING/$DOMAIN"
   install -d -m 700 "$PANEL_CERT/$DOMAIN"
-  # Один ключ — одна нода; только SFTP, IP-ограничение и запрет туннелей/PTY.
-  local home sshdir auth sftp
-  home=$(getent passwd "$SSH_USER" | cut -d: -f6)
-  local sshgroup; sshgroup=$(id -gn "$SSH_USER")
-  sshdir="$home/.ssh"; auth="$sshdir/authorized_keys"
-  install -d -m 700 -o "$SSH_USER" -g "$sshgroup" "$sshdir"
-  touch "$auth"; chown "$SSH_USER:$SSH_USER" "$auth"; chmod 600 "$auth"
-  sftp=/usr/lib/openssh/sftp-server
-  [[ -x "$sftp" ]] || die "Нет $sftp; проверьте OpenSSH sftp-server"
-  # Публичный ключ только одна строка (без переводов), не добавляем второй раз.
   local key_b64
   key_b64=$(awk '{print $2}' <<< "$PUBLIC_KEY")
   if ! grep -Fq "$key_b64" "$auth"; then
     printf 'from="%s",restrict,command="%s -d %s/%s" %s\n' \
       "$NODE_IP" "$sftp" "$STAGING" "$DOMAIN" "$PUBLIC_KEY" >> "$auth"
   fi
-  chmod 600 "$auth"
   service_timer rw-hy2-panel-sync "$APP/setup.sh panel-sync" 30min
   if ! docker inspect remnawave --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep -Fxq "$PANEL_SSL_CONTAINER"; then
     log "ВНИМАНИЕ: в remnawave нет bind mount $PANEL_SSL_CONTAINER"
-    log "Добавьте /opt/remnawave/xray-ssl:$PANEL_SSL_CONTAINER:ro через Compose override, затем пересоздайте только remnawave."
+    log "Добавьте /opt/remnawave/xray-ssl:$PANEL_SSL_CONTAINER:ro через Compose override."
   fi
-  log "Ключ зарегистрирован для $NODE_IP; staging: $STAGING/$DOMAIN"
-  log 'Для SSH-первого подключения проверьте отпечаток панели и заполните known_hosts на ноде.'
+  log "Ключ зарегистрирован для ноды $NODE_IP в отдельном непривилегированном аккаунте $UPLOAD_USER."
+  log 'На ноде проверьте отпечаток панели и заполните /root/.ssh/known_hosts.'
 }
+
 panel_sync(){
   require_root
   command -v openssl >/dev/null || die 'Нужен openssl'
@@ -254,34 +298,131 @@ panel_sync(){
     panel_apply "$domain" || true
   done
 }
-panel_apply(){
-  local d="$1" cfg="/etc/remnawave-hy2/restart-${1}.env"
-  local PANEL_API_URL= NODE_UUID= API_TOKEN=
-  [[ -e "$APP/state/$d.needs-apply" ]] || return 0
-  if [[ ! -r "$cfg" ]]; then
-    log "Для $d требуется Force Restart ноды в панели; опциональный API-файл $cfg ещё не настроен."
-    return 1
-  fi
-  # Файл настроек доступен только root и не загружается из сети.
-  # shellcheck disable=SC1090
-  source "$cfg"
-  [[ "$PANEL_API_URL" == 'http://127.0.0.1:3000' ]] || { log 'API разрешён только через loopback панели'; return 1; }
-  [[ "$NODE_UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { log "Некорректный UUID для $d"; return 1; }
-  [[ -n "$API_TOKEN" ]] || { log "Нет API-токена для $d"; return 1; }
-  local http
-  http=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-    -X POST -H "Authorization: Bearer $API_TOKEN" \
-    -H 'Content-Type: application/json' \
-    -d '{"forceRestart":true}' \
-    "$PANEL_API_URL/api/nodes/$NODE_UUID/actions/restart") || { log "Ошибка API для $d"; return 1; }
-  if [[ "$http" == 200 || "$http" == 202 || "$http" == 204 ]]; then
-    rm -f "$APP/state/$d.needs-apply"
-    log "Force Restart через API отправлен для $d (HTTP $http)."
-  else
-    log "Force Restart через API не выполнен (HTTP $http): проверьте токен/права/UUID."
-    return 1
-  fi
+api_files(){
+  need_domain
+  API_META="$CRED_DIR/node-${DOMAIN}.meta"
+  API_TOKEN_FILE="$CRED_DIR/node-${DOMAIN}.token"
 }
+api_http(){
+  # Секрет передаётся curl через временный файл заголовка (0600), а НЕ argv, env или URL.
+  local method="$1" url="$2" code rc=0 header
+  header=$(mktemp)
+  chmod 600 "$header"
+  printf 'Authorization: Bearer %s\n' "$(cat "$API_TOKEN_FILE")" > "$header"
+  if [[ "$method" == POST ]]; then
+    code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      -X POST --header "@$header" -H 'Content-Type: application/json' \
+      --data '{"forceRestart":true}' "$url") || rc=$?
+  else
+    code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      --header "@$header" "$url") || rc=$?
+  fi
+  rm -f "$header"
+  (( rc == 0 )) || return "$rc"
+  printf '%s' "$code"
+}
+api_configure(){
+  require_root; api_files
+  valid_uuid "$NODE_UUID" || die 'UUID ноды должен соответствовать формату 8-4-4-4-12'
+  [[ -t 0 ]] || die 'Для скрытого ввода ключа нужен интерактивный терминал (TTY)'
+  command -v curl >/dev/null || die 'Нужен curl'
+  install -d -m 700 "$CRED_DIR"
+  local input temp old_file="" code
+  IFS= read -rs -p "Вставьте API-токен Remnawave для ноды $DOMAIN (ввод скрыт): " input
+  printf '\n'
+  [[ "$input" =~ ^[a-zA-Z0-9._~-]{16,512}$ ]] || { unset input; die 'Неверный формат токена. Пробелы, переводы строк и спецсимволы запрещены.'; }
+  temp=$(mktemp "$CRED_DIR/.token.XXXXXX")
+  chmod 600 "$temp"
+  printf '%s' "$input" > "$temp"; unset input
+  # Проверить токен на API без изменения конфигурации панели/ноды.
+  old_file=$API_TOKEN_FILE
+  API_TOKEN_FILE=$temp
+  code=$(api_http GET "$PANEL_API_URL/api/nodes/$NODE_UUID") || { rm -f "$temp"; die 'Панель API недоступна. Токен не сохранён.'; }
+  API_TOKEN_FILE=$old_file
+  if [[ "$code" != 200 ]]; then
+    rm -f "$temp"
+    die "API отклонило запрос (HTTP $code). Проверьте UUID, токен и права nodes:read/nodes:write; токен не сохранён."
+  fi
+  mv -f "$temp" "$API_TOKEN_FILE"
+  printf '%s\n' "$NODE_UUID" > "$API_META"
+  chmod 600 "$API_META" "$API_TOKEN_FILE"
+  log "Ключ проверен через API и сохранён в файле root-only $API_TOKEN_FILE."
+  log 'Он не хранится в коде GitHub и не передаётся в аргументах команды.'
+}
+api_test(){
+  require_root; api_files
+  [[ -s "$API_TOKEN_FILE" && -s "$API_META" ]] || die 'Сначала выполните api-setup'
+  local uuid code
+  uuid=$(cat "$API_META")
+  valid_uuid "$uuid" || die 'Сохранённый UUID некорректен'
+  code=$(api_http GET "$PANEL_API_URL/api/nodes/$uuid") || die 'Нет связи с локальным Remnawave API'
+  log "Проверка API для $DOMAIN: HTTP $code (должен быть 200)"
+  [[ "$code" == 200 ]]
+}
+api_delete(){
+  require_root; api_files
+  rm -f "$API_TOKEN_FILE" "$API_META"
+  log "Локальные API-данные для $DOMAIN удалены. Сам токен нужно отозвать также в панели Remnawave."
+}
+panel_apply(){
+  require_root
+  DOMAIN="$1"; api_files
+  [[ -e "$APP/state/$DOMAIN.needs-apply" ]] || { log 'Применение не требуется (нет маркера обновления).'; return 0; }
+  [[ -s "$API_TOKEN_FILE" && -s "$API_META" ]] || { log "Для $DOMAIN требуется ручной Force Restart конкретной ноды: API-ключ не настроен."; return 1; }
+  local uuid code
+  uuid=$(cat "$API_META")
+  valid_uuid "$uuid" || { log 'UUID ноды в конфигурации повреждён'; return 1; }
+  # Endpoint и forceRestart=true сверены с Remnawave Docs. Только целевая нода.
+  code=$(api_http POST "$PANEL_API_URL/api/nodes/$uuid/actions/restart") || { log 'Ошибка соединения с API. Маркер оставлен.'; return 1; }
+  case "$code" in
+    200|202|204)
+      rm -f "$APP/state/$DOMAIN.needs-apply"
+      log "API приняло запрос на Force Restart ноды $DOMAIN (HTTP $code). Проверяйте конечный сертификат отдельно."
+      ;;
+    *) log "API не приняло Force Restart (HTTP $code); маркер сохранён."; return 1;;
+  esac
+}
+cleanup_legacy_panel(){
+  require_root; need_domain
+  local auth=/home/lendry/.ssh/authorized_keys keytag='hy2-transfer-temp'
+  [[ -s "$PANEL_CERT/$DOMAIN/fullchain.pem" ]] || die 'Сначала убедитесь, что актуальный сертификат получен'
+  [[ -f "$UPLOAD_HOME/.ssh/authorized_keys" ]] || die 'Новый SFTP-ключ не зарегистрирован'
+  [[ -f "$APP/state/$DOMAIN.sha256" ]] || die 'Нет подтверждения первого импорта через panel-sync; сначала проверьте новую схему синхронизации'
+  cmp -s "$STAGING/$DOMAIN/fullchain.pem" "$PANEL_CERT/$DOMAIN/fullchain.pem" || die 'Импортированный сертификат отличается от доставленного: очистка преждевременна'
+  cmp -s "$STAGING/$DOMAIN/privkey.key" "$PANEL_CERT/$DOMAIN/privkey.key" || die 'Импортированный ключ отличается от доставленного: очистка преждевременна'
+  [[ -f "$auth" ]] || { log 'Старый authorized_keys не найден'; return 0; }
+  local count
+  count=$(grep -Fc "$keytag" "$auth" || true)
+  (( count > 0 )) || { log 'Ключ hy2-transfer-temp отсутствует'; return 0; }
+  log "Найдено $count временных SSH-ключей с пометкой $keytag для удаления."
+  [[ -t 0 ]] || die 'Нужен терминал для подтверждения'
+  local yesno
+  read -r -p 'Отозвать этот ключ из authorized_keys? [yes/NO] ' yesno
+  [[ "$yesno" == yes ]] || { log 'Без изменений'; return 0; }
+  local backup tmp
+  backup="$auth.bak.$(date +%Y%m%d_%H%M%S)"
+  cp -a "$auth" "$backup"
+  tmp=$(mktemp)
+  grep -Fv "$keytag" "$auth" > "$tmp" || true
+  cat "$tmp" > "$auth"
+  rm -f "$tmp"
+  chmod 600 "$auth"
+  log "Временный ключ отозван. Резервная копия: $backup"
+}
+cleanup_legacy_node(){
+  require_root; need_domain
+  local key=/root/.ssh/hy2-transfer-key
+  [[ -f "$key" ]] || { log 'Старого SSH-ключа нет'; return 0; }
+  [[ -s "$APP/keys/$DOMAIN.ed25519" ]] || die 'Новый ключ синхронизации ещё не установлен'
+  [[ -s "$APP/state/$DOMAIN.sent-ok" ]] || die 'Новая схема отправки ещё не выполнила ни одной успешной передачи'
+  [[ -t 0 ]] || die 'Нужен терминал для подтверждения'
+  local yesno
+  read -r -p 'Удалить временный /root/.ssh/hy2-transfer-key и .pub? [yes/NO] ' yesno
+  [[ "$yesno" == yes ]] || { log 'Без изменений'; return 0; }
+  rm -f "$key" "$key.pub"
+  log 'Старый ключ удалён с ноды; убедитесь, что он ранее отозван и на панели.'
+}
+
 status(){
   need_domain
   printf 'Caddy XHTTP: '; grep -Fq 'reverse_proxy unix+h2c//dev/shm/xrxh.socket' /opt/remnanode/Caddyfile 2>/dev/null && echo OK || echo NO
@@ -289,14 +430,21 @@ status(){
   printf 'UDP/443: '; ss -lunp 2>/dev/null | grep -Eq ':[4]43[[:space:]]' && echo OK || echo NO
   printf 'Node sync timer: '; systemctl is-active "rw-hy2-push-$DOMAIN.timer" 2>/dev/null || true
 }
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 [[ $# -ge 1 ]] || { usage; exit 1; }
 action="$1"; shift
 case "$action" in
-  node) [[ $# -ge 2 ]] || { usage; exit 1; }; DOMAIN="$1"; PANEL_HOST="$2"; SSH_USER="${3:-lendry}"; node_setup;;
-  panel) [[ $# -ge 3 ]] || { usage; exit 1; }; DOMAIN="$1"; NODE_IP="$2"; PUBLIC_KEY="$3"; SSH_USER="${4:-lendry}"; panel_setup;;
-  node-sync) [[ $# -ge 2 ]] || { usage; exit 1; }; DOMAIN="$1"; PANEL_HOST="$2"; SSH_USER="${3:-lendry}"; node_sync;;
+  node) [[ $# == 2 ]] || { usage; exit 1; }; DOMAIN="$1"; PANEL_HOST="$2"; node_setup;;
+  migrate) [[ $# == 2 ]] || { usage; exit 1; }; DOMAIN="$1"; PANEL_HOST="$2"; migrate;;
+  panel) [[ $# == 3 ]] || { usage; exit 1; }; DOMAIN="$1"; NODE_IP="$2"; PUBLIC_KEY="$3"; panel_setup;;
+  api-setup) [[ $# == 2 ]] || { usage; exit 1; }; DOMAIN="$1"; NODE_UUID="$2"; api_configure;;
+  api-test) DOMAIN="${1:?Укажите домен}"; api_test;;
+  api-delete) DOMAIN="${1:?Укажите домен}"; api_delete;;
+  node-sync) [[ $# == 2 ]] || { usage; exit 1; }; DOMAIN="$1"; PANEL_HOST="$2"; node_sync;;
   panel-sync) panel_sync;;
   status) DOMAIN="${1:?Укажите домен}"; status;;
-  panel-apply) require_root; DOMAIN="${1:?Укажите домен}"; panel_apply "$DOMAIN";;
+  panel-apply) DOMAIN="${1:?Укажите домен}"; panel_apply "$DOMAIN";;
+  cleanup-legacy-panel) DOMAIN="${1:?Укажите домен}"; cleanup_legacy_panel;;
+  cleanup-legacy-node) DOMAIN="${1:?Укажите домен}"; cleanup_legacy_node;;
   *) usage; exit 1;;
 esac
