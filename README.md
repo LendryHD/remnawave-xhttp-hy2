@@ -1,58 +1,31 @@
 # Remnawave XHTTP + Hysteria2 — дополнение к eGames
 
-Русскоязычный комплект для **уже установленных через eGames** нод Remnawave с Caddy. Настраивает путь **VLESS XHTTP через Unix-сокет Caddy** и **Hysteria2 на UDP/443**. Сохраняет существующий VLESS REALITY, NetBird, Caddy панели, MFA и подписки.
+**Версия 0.2 (предварительная, необходим тест на отдельной VPS).** Дополнение для **уже установленных через eGames** Remnawave Node с Caddy. Настраивает XHTTP через Caddy и Hysteria2 (UDP/443), организует доставку TLS-сертификата с ноды на панель и *при настройке отдельного API-токена Remnawave* отправляет запрос на применение нового сертификата.
 
-> **Статус: предварительный выпуск.** Логика подготовлена и проверена синтаксически; полный тест на отдельном тестовом VPS ещё не выполнен. Не запускайте без резервных копий на критичных серверах. Автоматизированное изменение профиля/хостов панели сознательно не реализовано: оно зависит от схемы конкретного Remnawave и должно выполняться по шагам ниже.
+**Не заменяет eGames.** Не устанавливает Remnawave/NetBird, не меняет Caddy панели, MFA, домены подписок, REALITY и каскады. Не создаёт автоматически inbound/host в панели. Новую ноду сначала устанавливают штатным мастером eGames.
 
-## Содержание
+> **Безопасность:** пока установщик не проверен на отдельном тестовом VPS, не запускайте его на боевой ноде. Перед любыми изменениями сохраните резервные копии. Скрипт не содержит и не требует публикации закрытых ключей и токенов.
 
-1. [Как устроена схема](#как-устроена-схема)
-2. [Что делает и не делает скрипт](#что-делает-и-не-делает-скрипт)
-3. [Подготовка](#подготовка)
-4. [Установка дополнения на ноду](#установка-дополнения-на-ноду)
-5. [Разрешение передачи сертификата на панели](#разрешение-передачи-сертификата-на-панели)
-6. [Конфигурационный профиль Remnawave](#конфигурационный-профиль-remnawave)
-7. [Настройка хостов в панели](#настройка-хостов-в-панели)
-8. [Автоматическое обновление сертификата](#автоматическое-обновление-сертификата)
-9. [Проверки, ошибки и откат](#проверки-ошибки-и-откат)
-10. [Добавление следующей ноды](#добавление-следующей-ноды)
-11. [Безопасность](#безопасность)
-
-## Как устроена схема
+## 1. Архитектура и требования
 
 ```text
-                          Remnawave Panel (Finland)
-                          + NetBird management
-                          + /opt/remnawave/xray-ssl/<domain>/
-                          + systemd panel-sync timer
-                              ^         |
-      SFTP, отдельный SSH-ключ|         | профиль + сертификат
-                              |         v
-Клиент HAPP -> TCP/443 REALITY -> Node Xray (порт 443 TCP)
-            -> TCP/443 XHTTP   -> Caddy -> unix+h2c -> Xray XHTTP socket
-            -> UDP/443 HY2    -> Node Xray QUIC + TLS
-
-На ноде: Caddy владеет сертификатом, node-sync timer отправляет копию на панель.
-На панели: panel-sync timer проверяет сертификат и обновляет файлы.
-При наличии API-токена панель инициирует Force Restart конкретной ноды.
+                         Remnawave Panel + NetBird
+                         /opt/remnawave/xray-ssl/<domain>/
+                                  ↑
+                    SFTP отдельным непривилегированным пользователем
+                                  ↑
+Клиент HAPP → нода eGames Caddy + Xray
+      VLESS REALITY → 443/TCP → Xray
+      VLESS XHTTP   → 443/TCP → Caddy → /dev/shm/xrxh.socket
+      Hysteria2     → 443/UDP → Xray (TLS от Caddy)
 ```
 
-**Важное ограничение:** один скрипт не создаёт саму ноду в панели и не подключает NetBird. Это выполняет eGames. После этого скрипт конфигурирует XHTTP/HY2. При первоначальной привязке *каждой* новой ноды нужно разрешить её SSH-ключ на панели; без заранее выданного права доступа безопасная полностью автономная установка невозможна.
+На **ноде**: Linux с systemd, Docker, `openssl`, `python3`, `ssh`, `scp`, `curl`, `flock`; уже развернуты `remnanode` и `caddy-remnawave` через eGames. DNS домена ноды должен вести на её публичный адрес. Caddy уже должен получить TLS-сертификат. На **панели**: Remnawave, `docker compose`, OpenSSH с `sftp-server` и доступный локально API `http://127.0.0.1:3000`. Если API размещён иначе, автоматический перезапуск не будет работать до отдельной адаптации; скрипт **не открывает API наружу**.
 
-## Что делает и не делает скрипт
-
-**Делает:** резервную копию Caddyfile ноды; добавляет `handle /xhttppath/*` с `reverse_proxy unix+h2c//dev/shm/xrxh.socket` (если маршрута ещё нет); проверяет конфигурацию Caddy и перезапускает **только Caddy ноды**; открывает UDP/443, если активен UFW; генерирует пример двух новых inbound; устанавливает таймер копирования сертификата Caddy; на панели создаёт защищённый каталог и таймер приёма; при наличии официального API-токена Remnawave может запустить Force Restart выбранной ноды после обновления сертификата.
-
-**Не делает:** не устанавливает Docker, eGames, Remnawave, NetBird; не изменяет REALITY или Caddy панели; не меняет SSH-порт; не настраивает каскады; не создаёт пользователей/хосты/профили через API; не отключает NetBird Default.
-
-## Подготовка
-
-Требуется: Ubuntu/Debian, root, Docker, Python 3, OpenSSL, OpenSSH, systemd, `flock`, установленная eGames-нода с **Caddy**, действующий сертификат домена и доступ к панели Remnawave. На панели должен существовать пользователь для SSH/SFTP (в примере `lendry`). На ноде должен быть рабочий REALITY на TCP/443.
-
-**Для панели один раз** подключите постоянный каталог к контейнеру `remnawave` через Compose override:
+На панели должен быть постоянный bind mount для сертификатов (как уже настроено в текущем проекте):
 
 ```yaml
-# /opt/remnawave/docker-compose.override.yml
+# /opt/remnawave/docker-compose.override.yml — добавьте, только если том отсутствует
 services:
   remnawave:
     volumes:
@@ -62,212 +35,242 @@ services:
         read_only: true
 ```
 
-Сначала сделайте `cp -a /opt/remnawave/docker-compose.yml /root/remnawave-compose.backup.yml` и проверьте `docker compose config`. Только после этого на панели выполните `cd /opt/remnawave && docker compose up -d --no-deps remnawave`, затем убедитесь, что панель `healthy`. **Не перезаписывайте существующий override:** если он есть, аккуратно дополните раздел `volumes` сервиса `remnawave`. Не используйте `docker compose down`.
+**Не перезаписывайте существующий `docker-compose.override.yml`.** При необходимости аккуратно дополните его, предварительно сохранив копию. Проверьте `cd /opt/remnawave && docker compose config` и примените `docker compose up -d --no-deps remnawave`. Не используйте `docker compose down`.
 
-Ниже предполагается, что `setup.sh` взят из доверенного GitHub-репозитория и его содержание проверено перед запуском. **Не используйте** `curl ... | bash`: установщик должен запускаться из обычного файла, чтобы сохранить собственную копию для systemd-таймеров.
+## 2. Загрузка установщика (на обеих VPS)
 
-Для одной команды на новой ноде (после eGames) используйте:
+Загрузите на **каждую** машину, где нужно выполнять команду. Сначала просмотрите скрипт:
 
 ```bash
-tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/LendryHD/remnawave-xhttp-hy2/main/setup.sh -o "$tmp" && sudo bash "$tmp" node node.example.com PANEL_IPV4 lendry; rm -f "$tmp"
+curl -fsSLo /root/remnawave-hy2-setup.sh \
+  https://raw.githubusercontent.com/LendryHD/remnawave-xhttp-hy2/main/setup.sh
+less /root/remnawave-hy2-setup.sh
+bash -n /root/remnawave-hy2-setup.sh
 ```
 
-Замените домен и IP панели. Для строгого контроля версий вместо `main` используйте заранее проверенный commit SHA. Команда меняет локальный Caddyfile ноды и открывает UDP/443 — для действующих серверов сначала изучите скрипт и резервную копию.
+Для воспроизводимого развёртывания рекомендуется заменить `main` в URL на проверенный SHA коммита.
 
-## Быстрый запуск одной командой
+## 3. Новая нода — одна команда после eGames
 
-После штатной установки ноды через eGames с Caddy и подключения к Remnawave можно скачать скрипт и запустить его **одной командой на ноде**:
+Сначала используйте eGames (`rr`) для установки ноды с Caddy и NetBird. Проверьте `https://node.example.com/` и TCP/443 REALITY. **На самой ноде:**
 
 ```bash
-curl -fsSLo /tmp/remnawave-xhttp-hy2-setup.sh https://raw.githubusercontent.com/LendryHD/remnawave-xhttp-hy2/main/setup.sh && sudo bash /tmp/remnawave-xhttp-hy2-setup.sh node node.example.com 203.0.113.10 lendry
+sudo bash /root/remnawave-hy2-setup.sh node node.example.com 203.0.113.10
 ```
 
-Замените `node.example.com` на **домен ноды**, `203.0.113.10` на **IP панели Remnawave**, `lendry` на пользователя SSH панели. **Проверьте содержимое скрипта перед запуском**; для максимально воспроизводимой установки фиксируйте проверенный commit вместо `main`.
+Замените `node.example.com` на домен **этой ноды**, `203.0.113.10` — на публичный IP **сервера панели** (не ноды). Скрипт:
 
-Эта команда автоматизирует **настройку самой ноды**, но не создание входящих подключений/хостов в веб-панели и не первоначальную регистрацию её SSH-ключа на панели. Эти шаги описаны ниже. Не запускайте на боевой ноде до успешной проверки на тестовом сервере.
+- сохранит резервную копию `/opt/remnanode/Caddyfile.bak.*` и добавит путь `/xhttppath/*` на `unix+h2c//dev/shm/xrxh.socket`, если он ещё отсутствует;
+- проверит `caddy validate`, затем перезапустит **только Caddy ноды**; в случае неудачи восстановит копию;
+- откроет `443/udp` через UFW, если он активен;
+- создаст JSON-шаблон двух inbound в `/opt/remnawave-hy2/examples/node.example.com/inbounds.json`;
+- создаст отдельную SSH-пару Ed25519 и `rw-hy2-push-node.example.com.timer` (проверка каждые 12 часов).
 
-## Установка дополнения на ноду
+**Эта команда не завершает всю установку в панели:** SSH-ключ ещё надо разрешить на панели, а JSON/inbound/host добавить в интерфейсе по инструкциям ниже.
 
-**На ноде**, уже установленной через `rr → 1 → 3` или `rr → 1 → 4` с Caddy:
+## 4. Уже работающая нода — безопасная миграция (Russia)
+
+Если REALITY, XHTTP и Hysteria2 **уже работают** (как `ru.synet.pw`), нельзя повторно заменять Caddyfile. Используйте **только** режим `migrate` на российском VPS:
 
 ```bash
-sudo bash setup.sh node NODE_DOMAIN PANEL_IPV4 lendry
+sudo bash /root/remnawave-hy2-setup.sh migrate ru.synet.pw 45.137.60.221
 ```
 
-Пример с условными значениями:
+Скрипт проверит наличие контейнеров eGames, XHTTP-маршрута, сокета и UDP/443. После этого установит только **таймер и SSH-ключ синхронизации**. **Никаких изменений Caddyfile, Xray JSON, inbound, MFA или NetBird не происходит.** В конце выводится публичный ключ вида `ssh-ed25519 AAAA... hy2-sync-ru.synet.pw`.
+
+Скопируйте **только публичную строку**. Приватный ключ остаётся на российском сервере в `/opt/remnawave-hy2/keys/`.
+
+## 5. Подключение передачи сертификата на панели
+
+На **сервере панели** загрузите тот же `setup.sh` и введите публичный ключ, полученный при `node`/`migrate`:
 
 ```bash
-sudo bash setup.sh node node.example.com 203.0.113.10 lendry
+sudo bash /root/remnawave-hy2-setup.sh panel \
+  ru.synet.pw 168.113.156.10 \
+  'ssh-ed25519 AAAA... hy2-sync-ru.synet.pw'
 ```
 
-Команда: создаст резервную копию Caddyfile; дополнит маршрут XHTTP; проверит `caddy validate`; перезапустит только `caddy-remnawave`; откроет UDP/443 в UFW; установит таймер `rw-hy2-push-node.example.com.timer`; выведет **публичный** SSH-ключ. Приватный ключ останется в `/opt/remnawave-hy2/keys/` с доступом только root.
+Для других нод замените домен и публичный адрес сервера. `panel` создаёт **отдельного непривилегированного пользователя** `rw-hy2-upload` (без sudo, с отключённым входом по паролю). Публичный ключ добавляется только с указанного IP, с `restrict` и принудительной командой `sftp-server`. Это **не** ключ и не пользователь `lendry` для управления сервером.
 
-Если XHTTP уже есть (как на действующей ноде), установка не изменит маршрут повторно. Если версия Caddyfile отличается от поддерживаемого шаблона eGames, скрипт остановится без подмены неизвестной конфигурации.
+Каталог приёма: `/var/lib/remnawave-hy2-upload/incoming/<domain>/`. Таймер панели: `rw-hy2-panel-sync.timer` (каждые 30 минут). Целевые сертификаты: `/opt/remnawave/xray-ssl/<domain>/`.
 
-Проверка:
+### Проверка отпечатка SSH сервера панели
 
-```bash
-sudo bash setup.sh status node.example.com
-sudo systemctl status rw-hy2-push-node.example.com.timer --no-pager
-```
-
-**Важно:** таймер отправки ещё не сможет войти на панель, пока публичный ключ не зарегистрирован там.
-
-## Разрешение передачи сертификата на панели
-
-**На панели** запустите:
+**На панели** получите известный отпечаток:
 
 ```bash
-sudo bash setup.sh panel NODE_DOMAIN NODE_PUBLIC_IPV4 'ssh-ed25519 AAAA... hy2-sync-node.example.com' lendry
-```
-
-Вводите ключ **целиком одной строкой** и именно публичный IP ноды, от которого пойдёт SSH. Скрипт добавляет в `authorized_keys` разрешение только с этого IP, с `restrict` и принудительным `sftp-server`. Вход по паролю, под root и интерактивную оболочку он не включает.
-
-Если используете вход SSH **по NetBird**, в `NODE_PUBLIC_IPV4` указывайте фактический адрес-источник NetBird. Не отключайте действующие правила SSH.
-
-Путь доставки: `/home/lendry/.hy2-transfer/NODE_DOMAIN/`. Туда поступают файлы `fullchain.pem` и `privkey.key`, на финальной панели они попадают в `/opt/remnawave/xray-ssl/NODE_DOMAIN/`. После регистрации ключа на панели **на ноде** сначала проверьте отпечаток её SSH-хоста, затем добавьте подтверждённый ключ в `/root/.ssh/known_hosts`. Условный пример проверки:
-
-```bash
-# На ПАНЕЛИ: доверенный отпечаток
 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-# На НОДЕ: сравнить с отпечатком, затем получить и проверить удалённый ключ
-ssh-keyscan -t ed25519 PANEL_IP > /tmp/panel-host-key
-ssh-keygen -lf /tmp/panel-host-key
-# Добавлять только ПОСЛЕ совпадения отпечатков:
-cat /tmp/panel-host-key >> /root/.ssh/known_hosts
-rm -f /tmp/panel-host-key
 ```
 
-Сразу проверить доставку:
+**На ноде** получите ключ, сверьте отпечаток вручную с выводом на панели и **только после совпадения** добавьте ключ в `known_hosts`:
 
 ```bash
-# НА НОДЕ
-sudo bash setup.sh node-sync node.example.com 203.0.113.10 lendry
-# НА ПАНЕЛИ
-sudo bash setup.sh panel-sync
-sudo ls -l /opt/remnawave/xray-ssl/node.example.com/
+ssh-keyscan -t ed25519 45.137.60.221 > /tmp/verified-panel-hostkey
+ssh-keygen -lf /tmp/verified-panel-hostkey
+# СРАВНИТЬ с отпечатком с панели, затем:
+install -d -m 700 /root/.ssh
+cat /tmp/verified-panel-hostkey >> /root/.ssh/known_hosts
+chmod 600 /root/.ssh/known_hosts
+rm -f /tmp/verified-panel-hostkey
 ```
 
-`panel-sync` принимает файл, только если домен присутствует в сертификате, до истечения остаётся не менее 7 дней, и открытый ключ сертификата соответствует закрытому ключу. Неверную пару он не применяет.
+Теперь **на ноде** запустите первое копирование, **на панели** — первый импорт:
 
-## Конфигурационный профиль Remnawave
+```bash
+# на НОДЕ
+sudo /opt/remnawave-hy2/setup.sh node-sync ru.synet.pw 45.137.60.221
 
-На **панели Remnawave** откройте **Управление → Конфигурационные профили → профиль ноды → JSON**. Сохраните резервную копию исходного JSON. Скрипт выводит файл:
+# на ПАНЕЛИ
+sudo /opt/remnawave-hy2/setup.sh panel-sync
+sudo ls -l /opt/remnawave/xray-ssl/ru.synet.pw/
+```
+
+Скрипт проверяет домен, срок действия (не менее 7 дней) и совпадение открытого ключа сертификата с закрытым. Если пара некорректна, обновление не применяется. Если новый сертификат принят, появляется маркер `/opt/remnawave-hy2/state/ru.synet.pw.needs-apply` до запроса на его применение.
+
+> **Примечание:** принудительный SFTP с отдельным пользователем ещё не тестировался в живой конфигурации. Если `scp` выдаст ошибку, смотрите `journalctl -u ssh` на панели; не ослабляйте настройки `sshd` и не переключайтесь на `root`/`lendry` для таймера.
+
+## 6. API-токен вводится через сам скрипт — без хардкода
+
+**Создавайте токен в веб-панели Remnawave**, а не в NetBird и не в Caddy MFA. Откройте Remnawave → **Настройки → API-токены**, выпустите отдельный токен для управления нодами. Запишите **UUID нужной ноды** в разделе «Ноды → Russia». Право токена должно позволять чтение ноды и её перезапуск; не используйте личные пароли. Для версии с областями доступа проверьте `nodes:read` и `nodes:write`.
+
+**На финском VPS панели** выполните:
+
+```bash
+sudo /opt/remnawave-hy2/setup.sh api-setup \
+  ru.synet.pw UUID-НОДЫ-RUSSIA
+```
+
+Скрипт попросит токен **в интерактивном терминале со скрытым вводом**. Токен **не является аргументом команды**, не вставляется в URL, `.env`, Compose или GitHub. При проверке он передаётся запросом к локальному `127.0.0.1:3000` через заголовок `Authorization: Bearer` и локальный временный файл `0600` (без секретов в аргументах `curl`). При HTTP 200 сохраняется в:
 
 ```text
-/opt/remnawave-hy2/examples/NODE_DOMAIN/inbounds.json
+/etc/remnawave-hy2/node-ru.synet.pw.token   # root:root, 0600
+/etc/remnawave-hy2/node-ru.synet.pw.meta    # UUID, 0600
 ```
 
-Он содержит **два элемента массива**: VLESS XHTTP и Hysteria2. Вставьте их *в массив `inbounds` существующего профиля*, не удаляя действующий REALITY inbound и другие настройки. Не вставляйте внешний `[...]` как вложенный массив. Должны быть 3 объекта:
+Если API не принимает токен или не видит ноду, скрипт не сохраняет новый токен и не перезапускает ничего. Проверка и удаление локальной копии:
 
-1. `Russia` или другой существующий Reality inbound — оставить без изменений;
-2. `NODE_DOMAIN-XHTTP` — `vless`, `network: xhttp`, `security: none`, Unix-сокет `/dev/shm/xrxh.socket,0666`, `path: /xhttppath/`, `mode: auto`;
-3. `NODE_DOMAIN-HY2` — `protocol: hysteria`, `version: 2`, `network: hysteria`, `security: tls`, UDP/443, `ALPN h3`, `congestion: bbr`, сертификаты из `/var/lib/remnawave/configs/xray/ssl/NODE_DOMAIN/`.
+```bash
+sudo /opt/remnawave-hy2/setup.sh api-test ru.synet.pw
+sudo /opt/remnawave-hy2/setup.sh api-delete ru.synet.pw
+```
 
-В **Ноды → Управление → нужная нода → Конфигурационный профиль** выделите все нужные inbound, нажмите **Применить/Сохранить**. Если новый inbound не появляется на ноде, выполните принудительный перезапуск **именно этой ноды** из интерфейса панели. Проверьте `ss -lunp | grep ':443'`, `ss -lntp | grep ':443'` и `ls -l /dev/shm/xrxh.socket` на сервере ноды.
+`api-delete` удаляет **только локальные файлы**. Для полного отзыва ключа удалите/отзовите его и в веб-панели Remnawave.
 
-Не заполняйте `clients` вручную: Remnawave делает это на основании пользователей.
+**Важно о двух уровнях авторизации:** `Authorization: Bearer` — токен самой Remnawave (используется нашим локальным скриптом). `X-Api-Key` — ключ портала Caddy MFA для **внешних** запросов через Caddy; он здесь не требуется и не сохраняется. NetBird API — третий, независимый токен. Подробнее: [Remnawave SDK](https://docs.rw/sdk/typescript-sdk/) и [eGames — внешний API](https://wiki.egam.es/configuration/external-api/).
 
-## Настройка хостов в панели
+## 7. Автоматическое применение нового сертификата
 
-Создайте по отдельному хосту на каждый новый inbound. Параметры выставляются **на веб-панели**, а не в Caddyfile панели.
+`panel-sync` сравнивает сертификаты и копирует новую проверенную пару в bind mount панели. Если файлы изменились, он отмечает `needs-apply` и пытается вызвать **только для UUID выбранной ноды**:
 
-| Поле панели | VLESS XHTTP | Hysteria2 |
+```http
+POST http://127.0.0.1:3000/api/nodes/<UUID>/actions/restart
+Authorization: Bearer <ТОКЕН_ИЗ_ФАЙЛА>
+Content-Type: application/json
+
+{"forceRestart":true}
+```
+
+При HTTP 200/202/204 маркер запроса удаляется; в журнале сохраняется только статус и домен, **не сам токен**. Это подтверждает принятие запроса API, **не гарантирует** уже завершённый перезапуск и появление нового TLS-сертификата у клиентов. Обязательно проверяйте HAPP и состояние ноды после первого применения. Если API недоступен, маркер остаётся, таймер повторит попытку; ручной вариант — `Ноды → Russia → Force Restart`.
+
+Проверки:
+
+```bash
+# На панели
+systemctl status rw-hy2-panel-sync.timer --no-pager
+journalctl -u rw-hy2-panel-sync.service -n 30 --no-pager
+
+# На ноде
+systemctl status rw-hy2-push-ru.synet.pw.timer --no-pager
+journalctl -u rw-hy2-push-ru.synet.pw.service -n 30 --no-pager
+```
+
+**Сертификат автоматически продлевает Caddy ноды.** Нода передаёт его на панель каждые 12 часов, панель импортирует каждые 30 минут. Без действующего API-токена доставка остаётся автоматической, но применение — ручным.
+
+## 8. Добавление inbound и хостов в Remnawave (для НОВОЙ ноды)
+
+**Не нужно выполнять этот раздел при миграции Russia**, если два inbound и два хоста уже работают.
+
+На панели Remnawave откройте «Конфигурационные профили» → нужный профиль. Сохраните резервную копию JSON. Из файла на ноде `/opt/remnawave-hy2/examples/<domain>/inbounds.json` добавьте **два объекта внутрь существующего массива `inbounds`** (не вставляйте вложенный массив). Не изменяйте исходный REALITY inbound.
+
+| Параметр | VLESS XHTTP | Hysteria2 |
+|---|---|---|
+| Tag | `<domain>-XHTTP` | `<domain>-HY2` |
+| Протокол | `vless` | `hysteria`, version 2 |
+| Внешний порт | TCP 443 через Caddy | UDP 443 |
+| Listen | `/dev/shm/xrxh.socket,0666` | `0.0.0.0:443` |
+| Network | `xhttp` | `hysteria` |
+| Security inbound | `none` (TLS завершается в Caddy) | `tls` |
+| Дополнительно | `mode=auto`, `path=/xhttppath/` | ALPN `h3`, BBR |
+| TLS файлы | не требуются в inbound | `/var/lib/remnawave/configs/xray/ssl/<domain>/` |
+
+В «Ноды → Управление → нужная нода → Профили» выберите старый REALITY и два новых inbound, **сохраните**. При необходимости выполните `Force Restart` только этой ноды, как делали с Russia при первоначальном внедрении XHTTP.
+
+Создайте два хоста для подписок:
+
+| Поле хоста | XHTTP | HY2 |
 |---|---|---|
 | Название | `Node XHTTP` | `Node Hysteria2` |
-| Inbound | `NODE_DOMAIN-XHTTP` | `NODE_DOMAIN-HY2` |
-| Адрес | `node.example.com` | `node.example.com` |
-| Внешний порт | `443` | `443` |
-| Security | `tls` | `tls` |
+| Inbound | `<domain>-XHTTP` | `<domain>-HY2` |
+| Address | `node.example.com` | `node.example.com` |
+| Port | 443 | 443 |
+| Security | `tls` (публичное) | `tls` |
 | SNI | `node.example.com` | `node.example.com` |
 | ALPN | `h2` | `h3` |
-| Path | `/xhttppath/` | Пусто |
+| Path | `/xhttppath/` | пусто |
 | Mode | `auto` | — |
-| Flow | Пусто | — |
-| Fingerprint | `chrome` по желанию | по умолчанию |
-| Allow insecure | Выкл. | Выкл. |
+| Flow | пусто | — |
+| Allow insecure | выкл. | выкл. |
 
-Привяжите хост к нужной ноде и внутренней группе пользователей. Обновите подписку в HAPP и проверьте доступность интернета **по каждому протоколу отдельно**. Для XHTTP `curl -i https://node.example.com/xhttppath/` может вернуть `HTTP 400` с `x-padding` — это признак прохождения HTTP-маршрута, но окончательная проверка только через клиента.
+Сохраните хосты, убедитесь, что они доступны нужной группе пользователей, обновите подписку в HAPP и по очереди проверьте внешний IP через каждое подключение. **Caddy панели и страницу подписок не меняйте.**
 
-## Автоматическое обновление сертификата
+## 9. Удаление старого временного SSH-ключа после миграции Russia
 
-1. **Caddy ноды** автоматически продлевает свой ACME-сертификат.
-2. Таймер ноды каждые 12 часов получает актуальный `.crt` и `.key` из `caddy-remnawave`, проверяет пару и отправляет по SFTP на панель.
-3. Таймер панели каждые 30 минут валидирует пару и копирует её в каталог, доступный Remnawave только для чтения.
-4. **Применение:** если не настроен API-токен, создаётся `/opt/remnawave-hy2/state/NODE_DOMAIN.needs-apply` и администратор выполняет **Force Restart одной ноды в панели**. Это честный полуавтоматический режим; без применения Xray может продолжать использовать старую копию.
-5. **Полный автоматический режим — опционально:** создайте на панели Remnawave API-токен для управления нодами и файл `/etc/remnawave-hy2/restart-NODE_DOMAIN.env` (доступ только root):
+**Только после успешного `node-sync`, `panel-sync` и проверки Hysteria2**. Старый ключ `hy2-transfer-temp`, созданный при ручном копировании сертификата, больше не нужен. На **панели**:
 
 ```bash
-sudo install -d -m 700 /etc/remnawave-hy2
-sudo nano /etc/remnawave-hy2/restart-node.example.com.env
-sudo chmod 600 /etc/remnawave-hy2/restart-node.example.com.env
+sudo /opt/remnawave-hy2/setup.sh cleanup-legacy-panel ru.synet.pw
 ```
 
-Содержимое файла (НЕ публиковать в GitHub):
+Скрипт найдёт только строки с пометкой `hy2-transfer-temp` в `/home/lendry/.ssh/authorized_keys`, попросит явное подтверждение `yes`, сохранит резервную копию файла и удалит эти строки. Не затрагивает другие ключи.
+
+На **российской ноде**:
 
 ```bash
-PANEL_API_URL='http://127.0.0.1:3000'
-NODE_UUID='00000000-0000-0000-0000-000000000000'
-API_TOKEN='TOKEN_FROM_PANEL_SETTINGS'
+sudo /opt/remnawave-hy2/setup.sh cleanup-legacy-node ru.synet.pw
 ```
 
-`NODE_UUID` берётся в разделе **Ноды → нужная нода**. Права токена должны позволять перезапускать ноды. После обновления сертификата скрипт отправляет `POST /api/nodes/{uuid}/actions/restart` с `{"forceRestart":true}` через loopback панели. **Этот API-вызов требует проверки на вашей версии Remnawave; до проверки не включайте его на боевой панели.** Файл `.needs-apply` удаляется только при HTTP 200/202/204. Если API недоступен, статус сохраняется и запрос будет повторён в следующий цикл.
+После подтверждения будет удалён только `/root/.ssh/hy2-transfer-key` и соответствующий `.pub`. Обычные SSH-ключи не затрагиваются. Старые временные копии сертификатов удаляйте отдельно после проверки, что они нигде не используются.
 
-Применение через API может кратковременно прерывать пользовательские подключения. Вручную запускать проверку сертификатов можно командами:
+## 10. Диагностика и откат
 
 ```bash
-# Нода
-sudo /opt/remnawave-hy2/setup.sh node-sync node.example.com PANEL_IP lendry
-# Панель
+# На ноде
+sudo /opt/remnawave-hy2/setup.sh status ru.synet.pw
+ss -lunp | grep ':443'              # UDP/443 Hysteria2
+ss -lntp | grep ':443'              # TCP/443 REALITY
+ls -l /dev/shm/xrxh.socket          # XHTTP
+curl --http2 -I https://ru.synet.pw/
+
+# На панели
+sudo /opt/remnawave-hy2/setup.sh api-test ru.synet.pw
 sudo /opt/remnawave-hy2/setup.sh panel-sync
 ```
 
-Срок сертификата проверяйте как в панели, так и по внешнему TLS. Следите за журналом:
+- `Permission denied (publickey)` — проверьте зарегистрированный публичный ключ, IP-источник, отпечаток панели, отдельного SFTP-пользователя; не включайте root SSH и парольный вход.
+- Сертификат устарел — посмотрите `node-sync`, срок TLS в Caddy, журналы обоих таймеров и маркер `.needs-apply`.
+- API 401/403 — токен неверен, истёк или недостаточно прав, проверьте настройки Remnawave. Не используйте токен Caddy MFA вместо Remnawave.
+- Нет XHTTP-сокета — проверьте, что inbound выбран для ноды; затем штатный Force Restart только этой ноды.
+- Caddy `502` на `/xhttppath/` — проверьте `/dev/shm/xrxh.socket` и доступ из контейнера Caddy.
+- Для отката Caddy **новой ноды** найдите сохранённый `/opt/remnanode/Caddyfile.bak.*`, восстановите нужный, проверьте `caddy validate` и перезапустите только Caddy ноды. Не удаляйте REALITY.
 
-```bash
-journalctl -u rw-hy2-push-node.example.com.service --no-pager -n 30
-journalctl -u rw-hy2-panel-sync.service --no-pager -n 30
-```
+## 11. Безопасность, ограничения и источники
 
-## Проверки, ошибки и откат
+- Не публикуйте приватный ключ REALITY, TLS `privkey.key`, `.token`, SSH-приватные ключи, `SECRET_KEY`, UUID+токен вместе, подписки пользователей или полный `dump-config`.
+- `migrate` не изменяет работающие VPN-протоколы, но может создать ключ и systemd-таймер. API-ключ можно ввести только на **панели**, он никогда не нужен на ноде.
+- Скрипт имеет право рестартовать **только выбранную ноду**, если вы сами настроили API и пришёл новый сертификат. Первое реальное применение нужно проверить вручную.
+- Транспорт SFTP не переправляет пользовательский VPN-трафик; он служит только для передачи сертификата. Не используйте его для каскадов.
+- Встроенный тест `bash tests/check.sh` проверяет синтаксис, TLS-пару и скрытую передачу API-токена на mock-клиенте. Он **не заменяет** тест развертывания на тестовой VPS.
 
-- `XHTTP socket missing`: проверьте отметку inbound на ноде; если JSON уже сохранён, используйте штатный **Force Restart** и `docker exec remnanode cli --dump-config` (не публикуйте полный конфиг — содержит секреты).
-- `Caddy 502`: проверьте, что `/dev/shm/xrxh.socket` появился и каталог `/dev/shm` общий.
-- `Hysteria2 не работает`: `ss -lunp | grep ':443'`, `ufw status`, проверить сертификат и настройки хоста `ALPN h3/SNI`.
-- `Permission denied (publickey)`: сверить публичный ключ, адрес-источник, разрешение `authorized_keys`, права `.ssh`, отпечаток SSH-хоста.
-- `Cannot check cert`: Caddy может хранить сертификат у другого ACME-провайдера; скрипт ищет `.crt` по домену во всём `/data/caddy/certificates`.
-- `needs-apply`: выполните **Force Restart только целевой ноды** в панели и после успеха удалите marker `rm /opt/remnawave-hy2/state/NODE_DOMAIN.needs-apply`, если API не используется.
+Документация: [Remnawave API](https://docs.rw/api/), [Remnawave SDK](https://docs.rw/sdk/typescript-sdk/), [eGames](https://wiki.egam.es/ru/), [Caddy reverse_proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy), [Remnawave Node TLS](https://docs.rw/install/remnawave-node/).
 
-Откат маршрута: резервные копии `/opt/remnanode/Caddyfile.bak.*`; выберите нужную проверенную копию, замените Caddyfile, проведите `docker exec caddy-remnawave caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`, затем `docker restart caddy-remnawave`. Не удаляйте REALITY inbound. Для отключения HY2 снимите соответствующую галочку в панели, затем удалите только правило `443/udp`, если оно больше никому не нужно.
-
-## Добавление следующей ноды
-
-1. Через eGames установите ноду с Caddy и NetBird; убедитесь, что REALITY маскировка открывается по HTTPS.
-2. Скачайте и проверьте `setup.sh`, на **новой ноде** запустите `sudo bash setup.sh node NODE_DOMAIN PANEL_IP lendry`.
-3. На **панели** одной командой зарегистрируйте показанный публичный ключ: `sudo bash setup.sh panel NODE_DOMAIN NODE_PUBLIC_IP 'ssh-ed25519 ...' lendry`.
-4. На ноде проверьте fingerprint панели и `sudo bash setup.sh node-sync NODE_DOMAIN PANEL_IP lendry`.
-5. На панели выполните `sudo bash setup.sh panel-sync` и проверьте наличие сертификата в контейнере `remnawave`.
-6. В панели вставьте два inbound в профиль, выберите их для ноды и создайте два Host согласно таблице.
-7. Проверьте HAPP и автоматические таймеры.
-
-**Честно о «одной команде»:** серверная настройка ноды занимает одну команду *после eGames*. Но первое доверенное подключение к панели и заполнение профиля/хостов требуют действий администратора. Чтобы убрать их, придётся отдельно разработать интеграцию с API Remnawave с правами записи конфигураций и безопасной регистрацией ключей.
-
-## Безопасность
-
-- Никогда не публикуйте `privkey.key`, SSH-приватные ключи, токены API панели, `SECRET_KEY`, ссылки на подписки и полный вывод `docker exec remnanode cli --dump-config`.
-- Приватный сертификат находится в панели **потому, что Remnawave сама передаёт TLS-файлы ноде**; это штатная, но чувствительная к компрометации схема.
-- SSH-ключ автоматической передачи допускается только с IP данной ноды и принудительно запускает SFTP без PTY/форвардинга. Для удаления ноды нужно удалить ровно её строку из `/home/lendry/.ssh/authorized_keys`, убрать её systemd-таймеры и закрытые файлы по домену.
-- Временный ключ `hy2-transfer-temp`, использованный при первой ручной передаче сертификата, **после успешного подключения нового ключа** удалить с панели из `authorized_keys` и с ноды `/root/.ssh/hy2-transfer-key*`.
-- Ни один рабочий сайт панели, MFA или адрес подписок не требуется закрывать или менять.
-
-## Источники
-
-- [Remnawave: TLS-файлы для ноды](https://docs.rw/install/remnawave-node/)
-- [eGames: установка отдельной ноды с Caddy](https://wiki.egam.es/ru/installation/node-only/)
-- [Remnawave: профиль и выбор inbound](https://docs.rw/learn-en/nodes/)
-- [Xray: TLS и автоматическая перезагрузка сертификата](https://github.com/XTLS/Xray-docs-next/blob/main/docs/ru/config/transports/tls.md)
-- [Caddy: reverse_proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
-
-## Лицензия
-
-MIT. Проект не является официальным компонентом Remnawave или eGames.
+Лицензия: MIT. Это неофициальное дополнение, не часть Remnawave/eGames.
