@@ -32,10 +32,10 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 SSH=(ssh -i "$NODE_SSH_KEY" -p "$NODE_PORT" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$NODE_KNOWN_HOSTS" -o ConnectTimeout=10 "$NODE_USER@$NODE_HOST")
-cert_path=$("\${SSH[@]}" "docker exec caddy-remnawave find /data/caddy/certificates -type f -name '$DOMAIN.crt' -print -quit")
+cert_path=$("${SSH[@]}" "docker exec caddy-remnawave find /data/caddy/certificates -type f -name '$DOMAIN.crt' -print -quit")
 [[ "$cert_path" == /data/caddy/certificates/*"/$DOMAIN.crt" ]] || { log 'Caddy не нашёл сертификат домена'; exit 1; }
-"\${SSH[@]}" "docker exec caddy-remnawave cat '$cert_path'" > "$TMP/fullchain.pem"
-"\${SSH[@]}" "docker exec caddy-remnawave cat '\${cert_path%.crt}.key'" > "$TMP/privkey.key"
+"${SSH[@]}" "docker exec caddy-remnawave cat '$cert_path'" > "$TMP/fullchain.pem"
+"${SSH[@]}" "docker exec caddy-remnawave cat '${cert_path%.crt}.key'" > "$TMP/privkey.key"
 
 # Отбрасываем неверный или устаревший сертификат и несовпадающий закрытый ключ.
 openssl x509 -in "$TMP/fullchain.pem" -noout -checkhost "$DOMAIN" | grep -q 'does match' || { log 'Неверный домен сертификата'; exit 1; }
