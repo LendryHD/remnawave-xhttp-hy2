@@ -224,7 +224,21 @@ if ! jq -e --argjson p "$PORT" '
     )
   end
 ' "$TEMP" > "$CFG" 2>/dev/null; then
-    echo 'Формат не поддержан: нужен полный Xray JSON с балансировщиком. Старый конфиг сохранён.' >&2
+    echo 'Формат не поддержан: ожидается один полный Xray JSON с routing.balancers.' >&2
+    echo 'Структура ответа (только имена полей, без токенов и конфигураций):' >&2
+    jq -r '
+      if type == "object" then
+        "JSON: object; поля: " + (keys | join(", ")) +
+        "; outbounds: " + (if (.outbounds | type) == "array" then (.outbounds | length | tostring) else "-" end) +
+        "; routing.balancers: " + (if (.routing.balancers | type) == "array" then (.routing.balancers | length | tostring) else "-" end) +
+        "; routing-поля: " + (if (.routing | type) == "object" then (.routing | keys | join(", ")) else "-" end)
+      elif type == "array" then
+        "JSON: array; элементов: " + (length | tostring) +
+        "; первый элемент: " + (if length > 0 then (.[0] | type) else "-" end) +
+        "; поля первого: " + (if length > 0 and (.[0] | type) == "object" then (.[0] | keys | join(", ")) else "-" end)
+      else "JSON: " + type end
+    ' "$TEMP" 2>/dev/null >&2 || echo 'Ответ не разобран как JSON.' >&2
+    echo 'Ни одна конфигурация не применена; PassWall2 не изменён.' >&2
     exit 1
 fi
 if ! "$LIB/ensure-xray.sh"; then
