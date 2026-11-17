@@ -252,6 +252,9 @@ LIB=/usr/libexec/synet-balancer
 PORT=$(cat "$BASE/port")
 TEMP=$(mktemp "$BASE/download.XXXXXX")
 CFG=$(mktemp "$BASE/checked.XXXXXX")
+# Xray infers configuration format from filename; BusyBox mktemp has no .json suffix.
+mv "$CFG" "$CFG.json"
+CFG="$CFG.json"
 trap 'rm -f "$TEMP" "$CFG"' EXIT HUP INT TERM
 
 # Only one instance at a time; avoid cron overlap.
