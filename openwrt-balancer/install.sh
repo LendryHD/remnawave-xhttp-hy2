@@ -14,7 +14,7 @@ die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 command -v opkg >/dev/null 2>&1 || die 'Требуется opkg (OpenWrt 24.10); apk пока не поддерживается.'
 command -v curl >/dev/null 2>&1 && curl -V >/dev/null 2>&1 || die 'curl повреждён; исправьте curl/libcurl до установки.'
 
-say '=== Synet: Remnawave Xray JSON → локальный SOCKS5 → PassWall2 ==='
+say '=== Synet v0.4: Remnawave Xray JSON → локальный SOCKS5 → PassWall2 ==='
 say 'Менять существующие DNS, маршруты, подписки и выбранный узел PassWall2 не будем.'
 
 if [ "${1:-}" = 'status' ]; then
@@ -175,9 +175,9 @@ while ! "$LIB/ensure-xray.sh"; do
     sleep 30
 done
 if [ "$(cat "$BASE/mode")" = ram ]; then
-    exec /tmp/synet-balancer/xray run -c "$BASE/active.json"
+    exec /tmp/synet-balancer/xray run -format json -c "$BASE/active.json"
 fi
-exec "$(command -v xray)" run -c "$BASE/active.json"
+exec "$(command -v xray)" run -format json -c "$BASE/active.json"
 SERVE
 chmod 700 "$LIB/serve.sh"
 
@@ -301,7 +301,7 @@ else
 fi
 VALIDATION_LOG=$(mktemp /tmp/synet-xray-check.XXXXXX)
 chmod 600 "$VALIDATION_LOG"
-if ! "$XRAY" run -test -c "$CFG" >"$VALIDATION_LOG" 2>&1; then
+if ! "$XRAY" run -test -format json -c "$CFG" >"$VALIDATION_LOG" 2>&1; then
     echo 'Xray отклонил JSON; конфигурация не применена.' >&2
     echo 'Версия ядра:' >&2
     "$XRAY" version 2>/dev/null | head -n 1 >&2 || true
