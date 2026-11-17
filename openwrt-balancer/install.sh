@@ -60,16 +60,33 @@ if ! command -v xray >/dev/null 2>&1; then
     fi
 fi
 
-say 'Установка отсутствующих зависимостей (без opkg upgrade)...'
+say 'Выбираю режим Xray (без opkg upgrade)...'
+MODE=persistent
+if ! command -v xray >/dev/null 2>&1; then
+    free_overlay=$(df -Pk /overlay | awk 'NR==2 {print $4}')
+    case "$free_overlay" in ''|*[!0-9]*) die 'Не удалось определить свободное место /overlay.' ;; esac
+    if [ "$free_overlay" -lt 36864 ]; then
+        MODE=ram
+        [ "$(uname -m)" = aarch64 ] || die 'RAM-режим поддерживает только архитектуру aarch64.'
+        free_tmp=$(df -Pk /tmp | awk 'NR==2 {print $4}')
+        free_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+        [ "$free_tmp" -ge 55000 ] || die 'Нужно >=55 МБ свободно в /tmp.'
+        [ "$free_mem" -ge 75000 ] || die 'Нужно >=75 МБ доступной RAM для пробного запуска.'
+        say 'RAM-режим: xray-core будет извлекаться из .ipk в /tmp (без установки во flash).'
+        say 'После перезагрузки загрузка Xray повторится автоматически.'
+    fi
+fi
 need=''
 command -v jq >/dev/null 2>&1 || need="$need jq"
-command -v xray >/dev/null 2>&1 || need="$need xray-core"
-if [ -n "$need" ]; then
-    opkg update || die 'Не удалось обновить списки пакетов; исправьте репозитории OpenWrt.'
-    # shellcheck disable=SC2086
-    opkg install $need || die "Не удалось установить:$need. Проверьте feed пакетов PassWall2. Никаких правил сети не меняли."
+if [ "$MODE" = persistent ]; then
+    command -v xray >/dev/null 2>&1 || need="$need xray-core"
 fi
-command -v xray >/dev/null 2>&1 || die 'Бинарный файл xray отсутствует после установки.'
+if [ -n "$need" ]; then
+    say "Установка зависимостей:$need"
+    opkg update || die 'Не удалось обновить списки пакетов.'
+    # shellcheck disable=SC2086
+    opkg install $need || die "Не удалось установить:$need. Сеть и правила PassWall2 не менялись."
+fi
 command -v jq >/dev/null 2>&1 || die 'jq не установлен.'
 
 mkdir -p "$BASE" "$LIB"
@@ -81,13 +98,82 @@ printf 'url = "%s"\n' "$escaped" > "$BASE/curl.conf"
 chmod 600 "$BASE/curl.conf"
 unset SUB escaped
 printf '%s\n' "$PORT" > "$BASE/port"
-chmod 600 "$BASE/port"
+printf '%s\n' "$MODE" > "$BASE/mode"
+chmod 600 "$BASE/port" "$BASE/mode"
+
+cat > "$LIB/ensure-xray.sh" <<'ENSURE'
+#!/bin/sh
+# Pull xray-core from configured, signature-checked OpenWrt feed into tmpfs.
+# No package installation and no postinst scripts.
+set -eu
+umask 077
+BASE=/etc/synet-balancer
+RUNTIME=/tmp/synet-balancer
+[ "$(cat "$BASE/mode")" = ram ] || { command -v xray >/dev/null 2>&1; exit $?; }
+[ -x "$RUNTIME/xray" ] && exit 0
+mkdir -p "$RUNTIME"
+chmod 700 "$RUNTIME"
+LOCK="$RUNTIME/.download-lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    n=0
+    while [ "$n" -lt 30 ]; do
+        [ -x "$RUNTIME/xray" ] && exit 0
+        sleep 2
+        n=$((n + 1))
+    done
+    echo 'Загрузка Xray заблокирована другой попыткой' >&2
+    exit 1
+fi
+cleanup() {
+    rm -f "$RUNTIME/xray-new" "$RUNTIME"/xray-core_*.ipk
+    rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+free_tmp=$(df -Pk /tmp | awk 'NR==2 {print $4}')
+free_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+[ "$free_tmp" -ge 55000 ] || { echo 'В /tmp недостаточно свободного места' >&2; exit 1; }
+[ "$free_mem" -ge 75000 ] || { echo 'Недостаточно RAM для запуска Xray' >&2; exit 1; }
+opkg update >/dev/null || { echo 'Не удалось обновить подписанные пакеты OpenWrt' >&2; exit 1; }
+cd "$RUNTIME"
+rm -f xray-core_*.ipk
+opkg download xray-core >/dev/null || { echo 'Не удалось скачать xray-core' >&2; exit 1; }
+pkg=$(find "$RUNTIME" -maxdepth 1 -name 'xray-core_*.ipk' -type f | head -1)
+[ -n "$pkg" ] && [ -s "$pkg" ] || { echo 'Пакет xray-core не найден' >&2; exit 1; }
+# OpenWrt 24.10 .ipk is tar.gz containing data.tar.gz and ./usr/bin/xray.
+if ! (tar -xOzf "$pkg" ./data.tar.gz | tar -xOzf - ./usr/bin/xray) > "$RUNTIME/xray-new"; then
+    echo 'Не удалось извлечь Xray из пакета' >&2
+    exit 1
+fi
+[ -s "$RUNTIME/xray-new" ] || exit 1
+chmod 700 "$RUNTIME/xray-new"
+"$RUNTIME/xray-new" version >/dev/null 2>&1 || { echo 'Xray не исполняется на этом CPU' >&2; exit 1; }
+mv "$RUNTIME/xray-new" "$RUNTIME/xray"
+echo 'Xray размещён в RAM (/tmp), без установки во flash.'
+ENSURE
+chmod 700 "$LIB/ensure-xray.sh"
+
+cat > "$LIB/serve.sh" <<'SERVE'
+#!/bin/sh
+set -eu
+BASE=/etc/synet-balancer
+LIB=/usr/libexec/synet-balancer
+while ! "$LIB/ensure-xray.sh"; do
+    echo 'Synet: повтор загрузки Xray через 30 секунд' >&2
+    sleep 30
+done
+if [ "$(cat "$BASE/mode")" = ram ]; then
+    exec /tmp/synet-balancer/xray run -c "$BASE/active.json"
+fi
+exec "$(command -v xray)" run -c "$BASE/active.json"
+SERVE
+chmod 700 "$LIB/serve.sh"
 
 cat > "$LIB/update.sh" <<'UPDATE'
 #!/bin/sh
 set -eu
 umask 077
 BASE=/etc/synet-balancer
+LIB=/usr/libexec/synet-balancer
 PORT=$(cat "$BASE/port")
 TEMP=$(mktemp "$BASE/download.XXXXXX")
 CFG=$(mktemp "$BASE/checked.XXXXXX")
@@ -127,7 +213,16 @@ if ! jq -e --argjson p "$PORT" '
     echo 'Формат не поддержан: нужен полный Xray JSON с балансировщиком. Старый конфиг сохранён.' >&2
     exit 1
 fi
-if ! xray run -test -c "$CFG" >/dev/null 2>&1; then
+if ! "$LIB/ensure-xray.sh"; then
+    echo 'Xray не удалось подготовить; конфигурация не применена.' >&2
+    exit 1
+fi
+if [ "$(cat "$BASE/mode")" = ram ]; then
+    XRAY=/tmp/synet-balancer/xray
+else
+    XRAY=$(command -v xray)
+fi
+if ! "$XRAY" run -test -c "$CFG" >/dev/null 2>&1; then
     echo 'Xray отклонил JSON; конфигурация не применена.' >&2
     exit 1
 fi
@@ -177,7 +272,7 @@ STOP=15
 start_service() {
   [ -s /etc/synet-balancer/active.json ] || return 1
   procd_open_instance
-  procd_set_param command /usr/bin/xray run -c /etc/synet-balancer/active.json
+  procd_set_param command /usr/libexec/synet-balancer/serve.sh
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
@@ -236,7 +331,7 @@ fi
 /etc/init.d/cron enable >/dev/null 2>&1 || true
 /etc/init.d/cron restart >/dev/null 2>&1 || true
 
-say 'ГОТОВО: 127.0.0.1:19080 (SOCKS5), обновление каждые 15 минут.'
+say "ГОТОВО: 127.0.0.1:19080 (SOCKS5), режим $MODE, обновление каждые 15 минут."
 say 'В PassWall2 вручную выберите узел: Synet eGames JSON (local).'
 say 'Прежде проверьте прокси: curl --socks5-hostname 127.0.0.1:19080 https://api.ipify.org'
 say 'Если после выбора пропадёт интернет, верните прежний узел PassWall2.'
