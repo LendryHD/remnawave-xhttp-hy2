@@ -181,6 +181,67 @@ exec "$(command -v xray)" run -c "$BASE/active.json"
 SERVE
 chmod 700 "$LIB/serve.sh"
 
+cat > "$LIB/merge.jq" <<'SYNET_MERGE_JQ'
+# Merge 1–2 eGames Xray JSON subscriptions into ONE Xray process.
+# Port 19080 is for profile #1, 19081 for profile #2.
+# All outbound and balancer tags are namespaced, routing stays per-inbound.
+def pref($p): if type == "string" then $p + . else . end;
+def transform_outbound($p):
+  .tag |= pref($p)
+  | if (.proxySettings.tag? | type) == "string" then .proxySettings.tag |= pref($p) else . end
+  | if (.streamSettings.sockopt.dialerProxy? | type) == "string" then .streamSettings.sockopt.dialerProxy |= pref($p) else . end;
+def transform_balancer($p):
+  .tag |= pref($p)
+  | .selector |= map(pref($p))
+  | if (.fallbackTag? | type) == "string" then .fallbackTag |= pref($p) else . end;
+def transform_rule($p; $in):
+  .inboundTag = [$in]
+  | if (.outboundTag? | type) == "string" then .outboundTag |= pref($p) else . end
+  | if (.balancerTag? | type) == "string" then .balancerTag |= pref($p) else . end;
+
+(if type == "object" then [.] elif type == "array" then . else error("Expected Xray JSON object or array") end) as $configs
+| if ($configs | length) < 1 or ($configs | length) > 2 then
+    error("Expected 1 or 2 JSON profiles")
+  elif ($configs | all(.[]; type == "object" and (.outbounds | type) == "array" and (.routing.balancers | type) == "array" and (.routing.balancers | length) > 0 and (.routing.rules | type) == "array" and (.burstObservatory.subjectSelector | type) == "array")) | not then
+    error("Every profile must contain outbounds, routing.balancers, routing.rules and burstObservatory")
+  elif ($configs | any(.[]; ((.outbounds | map(.tag) | unique | length) != (.outbounds | length)))) then
+    error("Duplicate outbound tags in a profile")
+  elif ($configs | map(.burstObservatory.pingConfig) | unique | length) != 1 then
+    error("Different burstObservatory pingConfig values; cannot combine safely")
+  elif ($configs | map(.dns) | unique | length) != 1 then
+    error("Different DNS configurations; cannot combine safely")
+  elif ($configs | map(.routing | del(.rules, .balancers)) | unique | length) != 1 then
+    error("Different global routing options; cannot combine safely")
+  else
+    ($configs | to_entries | map(
+      .key as $idx | .value as $c
+      | ("synet-" + (($idx + 1) | tostring) + "-") as $p
+      | ("synet-" + (($idx + 1) | tostring) + "-in") as $in
+      | ($port + $idx) as $listen_port
+      | {
+          inlet: {"tag": $in, "listen":"127.0.0.1", "port": $listen_port, "protocol":"socks", "settings":{"udp":true,"auth":"noauth"}},
+          outbounds: ($c.outbounds | map(transform_outbound($p))),
+          balancers: ($c.routing.balancers | map(transform_balancer($p))),
+          rules: ($c.routing.rules | map(transform_rule($p; $in))),
+          selectors: ($c.burstObservatory.subjectSelector | map(pref($p)))
+        }
+    )) as $parts
+    | ($configs[0] | {dns,log,policy}) as $opts
+    | $opts + {
+        inbounds: [$parts[].inlet],
+        outbounds: [$parts[].outbounds[]],
+        routing: (($configs[0].routing | del(.balancers, .rules)) + {
+          balancers: [$parts[].balancers[]],
+          rules: [$parts[].rules[]]
+        }),
+        burstObservatory: ($configs[0].burstObservatory + {
+          subjectSelector: ([$parts[].selectors[]] | unique)
+        })
+      }
+  end
+SYNET_MERGE_JQ
+chmod 600 "$LIB/merge.jq"
+
 cat > "$LIB/update.sh" <<'UPDATE'
 #!/bin/sh
 set -eu
@@ -208,22 +269,7 @@ fi
 
 # Intentionally accept ONLY one full Xray object, never URI-list or unknown wrappers.
 # Preserve balancers, outbounds and routing. Limit ingress to one local SOCKS listener.
-if ! jq -e --argjson p "$PORT" '
-  if type != "object" or (.outbounds | type) != "array" or
-     (.routing.balancers | type) != "array" or
-     (.routing.balancers | length) == 0 then
-    error("Ожидается один полный Xray JSON с routing.balancers")
-  else
-    .inbounds = (
-      if (.inbounds | type) == "array" then
-        [.inbounds[] | select(.protocol == "socks")][0:1]
-      else [] end
-      | if length == 0 then
-          [{"tag":"socks","listen":"127.0.0.1","port":$p,"protocol":"socks","settings":{"udp":true}}]
-        else map(.listen="127.0.0.1" | .port=$p) end
-    )
-  end
-' "$TEMP" > "$CFG" 2>/dev/null; then
+if ! jq -e --argjson port "$PORT" -f "$LIB/merge.jq" "$TEMP" > "$CFG" 2>/dev/null; then
     echo 'Формат не поддержан: ожидается один полный Xray JSON с routing.balancers.' >&2
     echo 'Структура ответа (только имена полей, без токенов и конфигураций):' >&2
     jq -r '
@@ -279,14 +325,25 @@ if [ -x /etc/init.d/synet-balancer ]; then
     else
         bound=$(netstat -lnt 2>/dev/null | grep -c "127.0.0.1:$PORT " || true)
     fi
-    if [ "$bound" = 0 ]; then
-        if [ -f "$BASE/previous.json" ]; then
-            cp "$BASE/previous.json" "$BASE/active.json"
-            /etc/init.d/synet-balancer restart >/dev/null 2>&1 || true
+    count=$(jq -r '.inbounds | length' "$BASE/active.json")
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        current_port=$((PORT + i))
+        if command -v ss >/dev/null 2>&1; then
+            bound=$(ss -lnt | grep -c "127.0.0.1:$current_port " || true)
+        else
+            bound=$(netstat -lnt 2>/dev/null | grep -c "127.0.0.1:$current_port " || true)
         fi
-        echo 'SOCKS-порт не открылся; старая конфигурация восстановлена.' >&2
-        exit 1
-    fi
+        if [ "$bound" = 0 ]; then
+            if [ -f "$BASE/previous.json" ]; then
+                cp "$BASE/previous.json" "$BASE/active.json"
+                /etc/init.d/synet-balancer restart >/dev/null 2>&1 || true
+            fi
+            echo "SOCKS-порт $current_port не открылся; возвращена предыдущая конфигурация (если была)." >&2
+            exit 1
+        fi
+        i=$((i + 1))
+    done
 fi
 echo 'Проверенная конфигурация обновлена.'
 UPDATE
@@ -321,33 +378,50 @@ if command -v ss >/dev/null 2>&1; then
 else
     BOUND=$(netstat -lnt 2>/dev/null | grep -c "127.0.0.1:$PORT " || true)
 fi
-if [ "$BOUND" = 0 ]; then
-    say 'Служба пока не открыла порт; проверьте logread -e synet-balancer.'
-    die 'Автоматически выбирать узел PassWall2 не будем.'
-fi
-
-say 'Создание локального узла PassWall2 (без выбора активным)...'
-if command -v uci >/dev/null 2>&1; then
-  existing=''
-  for i in $(seq 0 99); do
-    name=$(uci -q get "passwall2.@nodes[$i].remarks" 2>/dev/null || true)
-    if [ "$name" = 'Synet eGames JSON (local)' ]; then
-      existing="@nodes[$i]"
-      break
+EXPECTED=$(jq -r '.inbounds | length' "$BASE/active.json")
+idx=0
+while [ "$idx" -lt "$EXPECTED" ]; do
+    current_port=$((PORT + idx))
+    if command -v ss >/dev/null 2>&1; then
+        BOUND=$(ss -lnt 2>/dev/null | grep -c "127.0.0.1:$current_port " || true)
+    else
+        BOUND=$(netstat -lnt 2>/dev/null | grep -c "127.0.0.1:$current_port " || true)
     fi
+    if [ "$BOUND" = 0 ]; then
+        die "SOCKS-порт $current_port не открылся. Выбранный узел PassWall2 не изменён."
+    fi
+    idx=$((idx + 1))
+done
+
+say 'Создание локальных SOCKS-узлов PassWall2 (без выбора активными)...'
+if command -v uci >/dev/null 2>&1; then
+  idx=0
+  while [ "$idx" -lt "$EXPECTED" ]; do
+    current_port=$((PORT + idx))
+    nr=$((idx + 1))
+    remark="Synet eGames $nr (local)"
+    existing=''
+    for i in $(seq 0 99); do
+      name=$(uci -q get "passwall2.@nodes[$i].remarks" 2>/dev/null || true)
+      if [ "$name" = "$remark" ]; then
+        existing="@nodes[$i]"
+        break
+      fi
+    done
+    if [ -z "$existing" ]; then
+      id=$(uci add passwall2 nodes)
+      uci set "passwall2.$id.remarks=$remark"
+      uci set "passwall2.$id.type=sing-box"
+      uci set "passwall2.$id.protocol=socks"
+      uci set "passwall2.$id.address=127.0.0.1"
+      uci set "passwall2.$id.port=$current_port"
+      say "Добавлен локальный узел: $remark, порт $current_port"
+    else
+      say "Узел уже существует: $remark"
+    fi
+    idx=$((idx + 1))
   done
-  if [ -z "$existing" ]; then
-    id=$(uci add passwall2 nodes)
-    uci set "passwall2.$id.remarks=Synet eGames JSON (local)"
-    uci set "passwall2.$id.type=Xray"
-    uci set "passwall2.$id.protocol=socks"
-    uci set "passwall2.$id.address=127.0.0.1"
-    uci set "passwall2.$id.port=$PORT"
-    uci commit passwall2
-    say 'Локальный SOCKS-узел добавлен; активный профиль и правила сохранены.'
-  else
-    say 'Локальный узел уже присутствует.'
-  fi
+  uci commit passwall2
 fi
 
 CRON='*/15 * * * * /usr/libexec/synet-balancer/update.sh >/dev/null 2>&1'
@@ -359,7 +433,12 @@ fi
 /etc/init.d/cron enable >/dev/null 2>&1 || true
 /etc/init.d/cron restart >/dev/null 2>&1 || true
 
-say "ГОТОВО: 127.0.0.1:19080 (SOCKS5), режим $MODE, обновление каждые 15 минут."
-say 'В PassWall2 вручную выберите узел: Synet eGames JSON (local).'
-say 'Прежде проверьте прокси: curl --socks5-hostname 127.0.0.1:19080 https://api.ipify.org'
+if [ "$EXPECTED" -eq 2 ]; then
+    say "ГОТОВО: два балансировщика через 127.0.0.1:19080 и :19081; режим $MODE."
+else
+    say "ГОТОВО: балансировщик через 127.0.0.1:19080; режим $MODE."
+fi
+say 'Автообновление — раз в 15 минут; текущие маршруты PassWall2 не переключены.'
+say 'В PassWall2 вручную выберите Synet eGames 1 (local) или Synet eGames 2 (local).'
+say 'Проверка: curl --socks5-hostname 127.0.0.1:19080 https://api.ipify.org'
 say 'Если после выбора пропадёт интернет, верните прежний узел PassWall2.'
