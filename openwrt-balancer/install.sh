@@ -57,12 +57,15 @@ if ! command -v xray >/dev/null 2>&1; then
         free_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
         [ "$free_tmp" -ge 55000 ] || die 'Нужно >=55 МБ свободно в /tmp.'
         [ "$free_mem" -ge 75000 ] || die 'Нужно >=75 МБ доступной RAM для пробного запуска.'
-        say 'RAM-режим: xray-core будет извлекаться из .ipk в /tmp (без установки во flash).'
+        say 'RAM-режим: Xray будет загружен в /tmp, без установки во flash.'
         say 'После перезагрузки загрузка Xray повторится автоматически.'
     fi
 fi
 need=''
 command -v jq >/dev/null 2>&1 || need="$need jq"
+if [ "$MODE" = ram ]; then
+    command -v unzip >/dev/null 2>&1 || need="$need unzip"
+fi
 if [ "$MODE" = persistent ]; then
     command -v xray >/dev/null 2>&1 || need="$need xray-core"
 fi
@@ -88,7 +91,7 @@ chmod 600 "$BASE/port" "$BASE/mode"
 
 cat > "$LIB/ensure-xray.sh" <<'ENSURE'
 #!/bin/sh
-# Pull xray-core from configured, signature-checked OpenWrt feed into tmpfs.
+# Prefer official Xray release (HY2 support), falling back to signed OpenWrt feed.
 # No package installation and no postinst scripts.
 set -eu
 umask 077
@@ -110,7 +113,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     exit 1
 fi
 cleanup() {
-    rm -f "$RUNTIME/xray-new" "$RUNTIME"/xray-core_*.ipk
+    rm -f "$RUNTIME/xray-new" "$RUNTIME/xray.zip" "$RUNTIME/xray.zip.dgst" "$RUNTIME"/xray-core_*.ipk
     rmdir "$LOCK" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
@@ -118,13 +121,37 @@ free_tmp=$(df -Pk /tmp | awk 'NR==2 {print $4}')
 free_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
 [ "$free_tmp" -ge 55000 ] || { echo 'В /tmp недостаточно свободного места' >&2; exit 1; }
 [ "$free_mem" -ge 75000 ] || { echo 'Недостаточно RAM для запуска Xray' >&2; exit 1; }
-opkg update >/dev/null || { echo 'Не удалось обновить подписанные пакеты OpenWrt' >&2; exit 1; }
 cd "$RUNTIME"
+# v26.11.9 includes Hysteria2 support; the older OpenWrt feed may not.
+ZIP_URL='https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-arm64-v8a.zip'
+if curl -fsSL --connect-timeout 10 --max-time 180 --retry 1 -o "$RUNTIME/xray.zip" "$ZIP_URL" &&
+   curl -fsSL --connect-timeout 10 --max-time 30 --retry 1 -o "$RUNTIME/xray.zip.dgst" "$ZIP_URL.dgst"; then
+    expected=$(awk -F '= ' '/256=/ {print $2; exit}' "$RUNTIME/xray.zip.dgst" | tr -d '\r')
+    actual=$(sha256sum "$RUNTIME/xray.zip" | awk '{print $1}')
+    [ -n "$expected" ] && [ "$actual" = "$expected" ] || {
+        echo 'SHA256 официального архива не совпал: загрузка отменена.' >&2
+        exit 1
+    }
+    if unzip -p "$RUNTIME/xray.zip" xray > "$RUNTIME/xray-new"; then
+        chmod 700 "$RUNTIME/xray-new"
+        if "$RUNTIME/xray-new" version >/dev/null 2>&1; then
+            mv "$RUNTIME/xray-new" "$RUNTIME/xray"
+            echo 'Xray v26.11.9 загружен и проверен в /tmp.'
+            exit 0
+        fi
+    fi
+    echo 'Не удалось запустить официальный ARM64 Xray; попробую пакет OpenWrt.' >&2
+else
+    echo 'GitHub Releases недоступен; попробую пакет из feed OpenWrt.' >&2
+fi
+rm -f "$RUNTIME/xray.zip" "$RUNTIME/xray.zip.dgst" "$RUNTIME/xray-new"
+# Fallback: OpenWrt 24.10 .ipk is a tar.gz containing data.tar.gz.
+# This feed may have an old core without Hysteria2 support.
+opkg update >/dev/null || { echo 'Не удалось обновить подписанные пакеты OpenWrt' >&2; exit 1; }
 rm -f xray-core_*.ipk
 opkg download xray-core >/dev/null || { echo 'Не удалось скачать xray-core' >&2; exit 1; }
 pkg=$(find "$RUNTIME" -maxdepth 1 -name 'xray-core_*.ipk' -type f | head -1)
 [ -n "$pkg" ] && [ -s "$pkg" ] || { echo 'Пакет xray-core не найден' >&2; exit 1; }
-# OpenWrt 24.10 .ipk is tar.gz containing data.tar.gz and ./usr/bin/xray.
 if ! (tar -xOzf "$pkg" ./data.tar.gz | tar -xOzf - ./usr/bin/xray) > "$RUNTIME/xray-new"; then
     echo 'Не удалось извлечь Xray из пакета' >&2
     exit 1
@@ -133,7 +160,7 @@ fi
 chmod 700 "$RUNTIME/xray-new"
 "$RUNTIME/xray-new" version >/dev/null 2>&1 || { echo 'Xray не исполняется на этом CPU' >&2; exit 1; }
 mv "$RUNTIME/xray-new" "$RUNTIME/xray"
-echo 'Xray размещён в RAM (/tmp), без установки во flash.'
+echo 'Xray из feed OpenWrt размещён в RAM; Hysteria2 может быть недоступна.'
 ENSURE
 chmod 700 "$LIB/ensure-xray.sh"
 
