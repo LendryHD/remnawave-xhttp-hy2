@@ -6,10 +6,16 @@ def transform_outbound($p):
   .tag |= pref($p)
   | if (.proxySettings.tag? | type) == "string" then .proxySettings.tag |= pref($p) else . end
   | if (.streamSettings.sockopt.dialerProxy? | type) == "string" then .streamSettings.sockopt.dialerProxy |= pref($p) else . end;
+# Preserve explicit VPN reserve outbounds, but never fail over to "direct".
+# Missing fallback also becomes a dedicated blackhole for fail-closed operation.
 def transform_balancer($p):
   .tag |= pref($p)
   | .selector |= map(pref($p))
-  | if (.fallbackTag? | type) == "string" then .fallbackTag |= pref($p) else . end;
+  | .fallbackTag = (
+      if (.fallbackTag? | type) != "string" or .fallbackTag == "direct"
+      then $p + "failclosed"
+      else ($p + .fallbackTag) end
+    );
 def transform_rule($p; $in):
   .inboundTag = [$in]
   | if (.outboundTag? | type) == "string" then .outboundTag |= pref($p) else . end
@@ -36,9 +42,12 @@ def transform_rule($p; $in):
       | ($port + $idx) as $listen_port
       | {
           inlet: {"tag": $in, "listen":"127.0.0.1", "port": $listen_port, "protocol":"socks", "settings":{"udp":true,"auth":"noauth"}},
-          outbounds: ($c.outbounds | map(transform_outbound($p))),
+          outbounds: (($c.outbounds | map(transform_outbound($p))) + [{"tag": ($p + "failclosed"),"protocol":"blackhole"}]),
           balancers: ($c.routing.balancers | map(transform_balancer($p))),
-          rules: ($c.routing.rules | map(transform_rule($p; $in))),
+          # A final per-inbound rule prevents an unmatched request from using
+          # Xray's first outbound as an implicit route.
+          rules: (($c.routing.rules | map(transform_rule($p; $in))) +
+            [{"inboundTag": [$in], "balancerTag": ($p + $c.routing.balancers[0].tag)}]),
           selectors: ($c.burstObservatory.subjectSelector | map(pref($p)))
         }
     )) as $parts
