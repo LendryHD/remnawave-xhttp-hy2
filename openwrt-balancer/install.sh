@@ -142,6 +142,7 @@ cat > "$LIB/serve.sh" <<'SERVE'
 set -eu
 BASE=/etc/synet-balancer
 LIB=/usr/libexec/synet-balancer
+[ -f /usr/share/v2ray/geoip.dat ] && export XRAY_LOCATION_ASSET=/usr/share/v2ray
 while ! "$LIB/ensure-xray.sh"; do
     echo 'Synet: повтор загрузки Xray через 30 секунд' >&2
     sleep 30
@@ -159,6 +160,7 @@ set -eu
 umask 077
 BASE=/etc/synet-balancer
 LIB=/usr/libexec/synet-balancer
+[ -f /usr/share/v2ray/geoip.dat ] && export XRAY_LOCATION_ASSET=/usr/share/v2ray
 PORT=$(cat "$BASE/port")
 TEMP=$(mktemp "$BASE/download.XXXXXX")
 CFG=$(mktemp "$BASE/checked.XXXXXX")
