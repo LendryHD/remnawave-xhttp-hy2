@@ -296,10 +296,18 @@ if [ "$(cat "$BASE/mode")" = ram ]; then
 else
     XRAY=$(command -v xray)
 fi
-if ! "$XRAY" run -test -c "$CFG" >/dev/null 2>&1; then
+VALIDATION_LOG=$(mktemp /tmp/synet-xray-check.XXXXXX)
+chmod 600 "$VALIDATION_LOG"
+if ! "$XRAY" run -test -c "$CFG" >"$VALIDATION_LOG" 2>&1; then
     echo 'Xray отклонил JSON; конфигурация не применена.' >&2
+    echo 'Версия ядра:' >&2
+    "$XRAY" version 2>/dev/null | head -n 1 >&2 || true
+    echo 'Последние строки диагностики Xray (перед отправкой проверьте отсутствие секретов):' >&2
+    tail -n 12 "$VALIDATION_LOG" >&2
+    rm -f "$VALIDATION_LOG"
     exit 1
 fi
+rm -f "$VALIDATION_LOG"
 if [ -f "$BASE/active.json" ] && cmp -s "$CFG" "$BASE/active.json"; then
     echo 'Конфигурация не изменилась.'
     exit 0
