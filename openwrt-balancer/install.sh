@@ -45,21 +45,6 @@ if [ -z "$SUB" ]; then
 fi
 case "$SUB" in https://*) :;; *) die 'Допускается только HTTPS-ссылка.';; esac
 
-# Xray-core takes about 27 MiB after unpacking. Keep headroom for the
-# configuration and normal router operations; never force an install on a full overlay.
-if ! command -v xray >/dev/null 2>&1; then
-    free_kb=$(df -Pk /overlay 2>/dev/null | awk 'NR == 2 {print $4}')
-    case "$free_kb" in
-        ''|*[!0-9]*) die 'Не удалось определить свободное место /overlay; установка остановлена.' ;;
-    esac
-    if [ "$free_kb" -lt 36864 ]; then
-        free_mb=$((free_kb / 1024))
-        say "Свободно в /overlay: ${free_mb} МБ. Минимум 36 МБ для безопасной установки Xray-core."
-        say 'Это ограничение хранилища, не ошибка версии OpenWrt или Remnawave.'
-        die 'Увеличьте /overlay (extroot/внешний накопитель) или освободите место. Ничего не удаляем автоматически.'
-    fi
-fi
-
 say 'Выбираю режим Xray (без opkg upgrade)...'
 MODE=persistent
 if ! command -v xray >/dev/null 2>&1; then
